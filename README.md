@@ -136,10 +136,3 @@ Authorization: Bearer <api-key>
 以上限制数据来源于接口 [https://models.opencode.ai/api.json](https://models.opencode.ai/api.json)（`opencode` key 下对应模型的 `limit` 字段），可自行查看核实，以实际使用为准。
 
 聊天上游返回 HTTP 错误或流解析失败时，在下游响应头尚未发送前归一为 `429`，便于账号池切换；流式头已发送后只能返回 SSE 错误事件，且不补 `[DONE]`。建连网络失败、建连超时及模型列表错误仍沿用原有的 `502` / `504` 分类。
-
-### 响应与超时边界
-
-- 正文原样保留，包括字面的 `<think>` / `<thinking>` 标签和普通 `thinking` 词句，不再猜测正文中的思考标记。思考字段归一为 `reasoning_content`；`reasoning_effort: "none"` 仅隐藏专用思考字段。兼容 `reasoningEffort` 别名。
-- 上游建连最多 60 秒；响应头后的首段数据最多等 30 秒，其后的网络读取空闲窗口为 120 秒，不计入下游背压暂停时间。
-- 所有已知 choice 完成后，继续读取 usage 到 EOF 或完成起累计 120 秒的尾段截止（下游背压暂停除外，usage 到达不重置总预算）；真正 `[DONE]` 之后最多再等 1 秒补尾部 usage。已完成响应遇到尾段超时仍成功收尾。
-- 免费上游不保证支持 `n > 1`；多 choice 解析有防御覆盖，不代表上游一定会返回请求的 choice 数量。
