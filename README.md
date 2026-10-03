@@ -4,6 +4,24 @@
 
 OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
 
+```mermaid
+flowchart TD
+    client["客户端<br/>Claude Code / Codex / DSH 等"]
+    gateway["聚合网关<br/>CLIProxyAPI / SUB2API / NEWAPI"]
+    a["oc2api 实例 A<br/>出口 IP 1"]
+    b["oc2api 实例 B<br/>出口 IP 2"]
+    c["oc2api 实例 C<br/>出口 IP 3"]
+    zen["OpenCode Zen<br/>免费模型"]
+
+    client --> gateway
+    gateway -->|轮询 / 负载| a
+    gateway -->|轮询 / 负载| b
+    gateway -->|轮询 / 负载| c
+    a --> zen
+    b --> zen
+    c --> zen
+```
+
 ## Vercel 部署
 
 ### 一键部署
@@ -22,7 +40,7 @@ OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本�
 
 部署完成后会得到一个 `https://<项目名>.vercel.app` 的域名。
 
-你可以 Fork 后部署多个 Vercel Project，以创建多个出口 IP 不同的项目，然后在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/blob/main/README_CN.md#%E5%8A%9F%E8%83%BD%E7%89%B9%E6%80%A7)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api/blob/main/README_CN.md)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api/blob/main/README.zh_CN.md#-%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B) 等工具中配置多个域名实现轮询，规避 IP 限制。
+你可以 Fork 后部署多个 Vercel Project，在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api) 等聚合网关中配置多个域名，实现轮询、负载分摊。多个项目不保证出口 IP 不同，需通过各实例的 `/ip` 核对；独立出口取决于实际部署。
 
 ## 本地运行
 
@@ -61,13 +79,13 @@ docker compose up -d --build
 npm test
 ```
 
-真实联调测试会向 `big-pickle` 发送两次请求：一次不带 tools 的非流式 `hi`，以及一次带 tools 的流式连续对话，并分别验证本地与 Vercel 入口（共 4 次请求）：
+真实联调包含 9 个用例：非流式回答、流式多轮对话、禁用工具、实际工具调用、工具结果回填，以及三个并行工具调用。全部首轮成功时至少发送 10 次 `big-pickle` 请求，工具自主选择的有限重试会增加请求数。Vercel 用例通过本地 HTTP 服务加载其入口，不等于远程 Vercel 部署验收：
 
 ```bash
 npm run test:live
 ```
 
-真实测试可能受到上游限流影响；限流时测试会输出原因并跳过，不影响离线测试。
+离线运行时联调用例跳过；显式启用联调后，HTTP 错误、超时、协议错误和未能实际调用工具均视为失败，不能用 skip 冒充通过。每个用例总预算为 120 秒，单次请求最多 90 秒；工具选择最多尝试三次，但仍受用例总预算约束。真实上游限流也会使联调失败，不影响离线测试。
 
 ## 代码检查
 
@@ -117,17 +135,11 @@ Authorization: Bearer <api-key>
 
 以上限制数据来源于接口 [https://models.opencode.ai/api.json](https://models.opencode.ai/api.json)（`opencode` key 下对应模型的 `limit` 字段），可自行查看核实，以实际使用为准。
 
-## 架构
+聊天上游返回 HTTP 错误或流解析失败时，在下游响应头尚未发送前归一为 `429`，便于账号池切换；流式头已发送后只能返回 SSE 错误事件，且不补 `[DONE]`。建连网络失败、建连超时及模型列表错误仍沿用原有的 `502` / `504` 分类。
 
-按功能域拆分，各文件内聚一类职责：
+### 响应与超时边界
 
-- `server/app.js`：Express app 组装——全局中间件 + 路由声明（`router.get` / `router.post`），以及 `startServer` 启动函数
-- `server/middleware.js`：CORS（[`cors`](https://www.npmjs.com/package/cors) 库）、URL 归一化、原始体缓冲、**路由级鉴权** `requireAuth`、404/错误兜底
-- `server/handler.js`：业务端点编排（health / ip / models / chat）
-- `server/zen.js`：OpenCode Zen 上游客户端（URL、超时、请求构造、模型列表、会话）
-- `server/openai.js`：OpenAI 兼容响应转换（非流式聚合、SSE 流式转发、thinking 归一化）
-- `server/shared.js`：跨文件共用的响应/解析工具；`server/config.js`：版本/鉴权/调试/端口配置；`server/log.js`：调试日志
-- `server/index.js`：本地启动脚本（`npm start` / Docker CMD），只负责启动与优雅退出
-- `api/index.js`：Vercel 薄入口，导入同一个 `server/app.js`
-
-公开路由（`/`、`/health`、`/ip`）免鉴权；`/v1/models`、`/v1/chat/completions` 等受保护路由通过路由级中间件鉴权，未知路径直接返回 404。
+- 正文原样保留，包括字面的 `<think>` / `<thinking>` 标签和普通 `thinking` 词句，不再猜测正文中的思考标记。思考字段归一为 `reasoning_content`；`reasoning_effort: "none"` 仅隐藏专用思考字段。兼容 `reasoningEffort` 别名。
+- 上游建连最多 60 秒；响应头后的首段数据最多等 30 秒，其后的网络读取空闲窗口为 120 秒，不计入下游背压暂停时间。
+- 所有已知 choice 完成后，继续读取 usage 到 EOF 或完成起累计 120 秒的尾段截止（下游背压暂停除外，usage 到达不重置总预算）；真正 `[DONE]` 之后最多再等 1 秒补尾部 usage。已完成响应遇到尾段超时仍成功收尾。
+- 免费上游不保证支持 `n > 1`；多 choice 解析有防御覆盖，不代表上游一定会返回请求的 choice 数量。
