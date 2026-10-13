@@ -1,6 +1,6 @@
 // OpenCode Zen 上游客户端。免费层的硬门槛（均对真实上游逐项验证过）：
 //   1. User-Agent 必须形如 opencode/<version>，其他一律 403；
-//   2. 必须带 x-opencode-session（ses_ + 26 位小写十六进制）；
+//   2. 必须带 x-opencode-session，且值须为合法 ID 形状（ses_ + 12 位十六进制 + 14 位 base62）；
 //   3. 请求体必须含 bash / read 两个"门禁工具"，缺失即 403；
 //   4. stream 必须为 true，stream:false 一律 403。
 // 除此之外上游就是标准 OpenAI 协议，本模块只补齐上述条件，业务字段原样透传。
@@ -167,6 +167,25 @@ export async function listModels() {
 const SESSION_TTL_MS = 30 * 60 * 1000
 const userSessions = new Map()
 
+// session 头必须符合 OpenCode 的 ID 格式，否则上游一律 403 FreeTier：
+// `ses_` + 12 位十六进制 + 14 位 base62（共 30 字符）。首 12 位不是任意十六进制，
+// 必须是 descending() 的 `~(timestamp * 0x1000 + counter)` 高 48 位，上游会据此校验。
+const ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+export function sessionId(timestamp = Date.now()) {
+  // 与上游 descending() 一致：value = ~(timestamp * 0x1000 + counter) 取低 48 位十六进制。
+  const value = ~(BigInt(timestamp) * 0x1000n + 1n)
+  let time = ""
+  for (let index = 0; index < 6; index += 1) {
+    time += Number((value >> BigInt(40 - 8 * index)) & 0xffn)
+      .toString(16)
+      .padStart(2, "0")
+  }
+  const bytes = new Uint8Array(14)
+  crypto.getRandomValues(bytes)
+  return "ses_" + time + [...bytes].map((byte) => ID_CHARS[byte % 62]).join("")
+}
+
 export function getSession(user) {
   const now = Date.now()
   const existing = userSessions.get(user)
@@ -174,9 +193,7 @@ export function getSession(user) {
     existing.at = now
     return existing.id
   }
-  const bytes = new Uint8Array(13)
-  crypto.getRandomValues(bytes)
-  const id = "ses_" + [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+  const id = sessionId(now)
   userSessions.set(user, { id, at: now })
   return id
 }
