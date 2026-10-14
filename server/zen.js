@@ -2,7 +2,7 @@
 //   - 使用 inference/v1、V2 User-Agent 和会话关联 headers，不发送旧的非标准 request ID；
 //   - 免费层要求 shell/read 的描述与参数 schema，旧版空工具定义会被 403；
 //   - 显式 tool_choice:none 也会被 403，改用保留工具描述并在响应层禁止工具调用。
-// 不注入 OpenCode 的系统提示词；业务消息和其余参数原样透传。
+// 不注入 OpenCode 系统提示词；客户端工具名双向映射，消息正文和业务参数保持不变。
 import { debugLog } from "./log.js"
 
 // A local relay can recover rejected requests before the adapter sees them.
@@ -62,16 +62,66 @@ export function areToolsDisabled(payload) {
   return payload.tool_choice === "none" || !Array.isArray(payload.tools) || payload.tools.length === 0
 }
 
-// 用户已经自带同名工具时保留用户定义，只补缺失的门禁工具。
+// 上游还校验 edit 等其它内置工具；只改 read/shell 仍会拒绝完整客户端工具集。
+// 所有客户端工具统一使用上游别名，schema、调用 ID 和工具结果保持不变。
 function withGateTools(tools) {
-  const result = Array.isArray(tools) ? tools.filter((tool) => tool && typeof tool === "object") : []
-  const present = new Set(result.map((tool) => tool?.function?.name).filter((name) => typeof name === "string"))
-  for (const name of GATE_TOOL_NAMES) {
-    if (present.has(name)) continue
-    result.push(gateTool(name))
-    present.add(name)
+  const clientTools = Array.isArray(tools) ? tools.filter((tool) => tool && typeof tool === "object") : []
+  const present = new Set(clientTools.map((tool) => tool?.function?.name))
+  const names = new Map()
+  for (const tool of clientTools) {
+    const name = tool?.function?.name
+    if (typeof name !== "string" || !name || names.has(name)) continue
+    const base = `oc2api_${name.replace(/[^A-Za-z0-9_-]/g, "_")}`.slice(0, 60)
+    let alias = base
+    let suffix = 1
+    while (present.has(alias)) {
+      const tail = `_${suffix++}`
+      alias = `${base.slice(0, 64 - tail.length)}${tail}`
+    }
+    present.add(alias)
+    names.set(name, alias)
   }
-  return result
+  const result = clientTools.map((tool) => {
+    const renamed = renameToolCall(tool, names)
+    if (renamed === tool) return tool
+    return {
+      ...renamed,
+      function: {
+        ...renamed.function,
+        description: `Client tool "${tool.function.name}"; use "${renamed.function.name}" for the client's "${tool.function.name}" operation. ${tool.function.description || ""}`,
+      },
+    }
+  })
+  result.push(...GATE_TOOL_NAMES.map(gateTool))
+  return { tools: result, names, aliases: new Map([...names].map(([name, alias]) => [alias, name])) }
+}
+
+function renameToolCall(call, names) {
+  const name = names.get(call?.function?.name)
+  return name ? { ...call, function: { ...call.function, name } } : call
+}
+
+function renameToolChoice(choice, names) {
+  const renamed = renameToolCall(choice, names)
+  if (!Array.isArray(renamed?.tools)) return renamed
+  return {
+    ...renamed,
+    tools: renamed.tools.map((tool) => {
+      const next = renameToolCall(tool, names)
+      return names.has(next?.name) ? { ...next, name: names.get(next.name) } : next
+    }),
+  }
+}
+
+function renameMessageTools(message, names) {
+  let next = message
+  if (Array.isArray(message?.tool_calls)) {
+    next = { ...next, tool_calls: message.tool_calls.map((call) => renameToolCall(call, names)) }
+  }
+  const legacyName = names.get(message?.function_call?.name)
+  if (legacyName) next = { ...next, function_call: { ...message.function_call, name: legacyName } }
+  if (message?.role === "function" && names.has(message.name)) next = { ...next, name: names.get(message.name) }
+  return next
 }
 
 export function isAllowedModelId(id) {
@@ -80,9 +130,11 @@ export function isAllowedModelId(id) {
 
 // 上游只接受流式；下游是否流式由响应层决定，与这里无关。
 export function buildUpstreamRequest(payload, sessionId) {
+  const toolsDisabled = areToolsDisabled(payload)
+  const adapted = withGateTools(toolsDisabled ? [] : payload.tools)
   const body = {
     ...payload,
-    tools: withGateTools(areToolsDisabled(payload) ? [] : payload.tools),
+    tools: adapted.tools,
     stream: true,
     stream_options: { include_usage: true },
   }
@@ -93,8 +145,12 @@ export function buildUpstreamRequest(payload, sessionId) {
 
   // V2 拒绝 none。禁用时不提供用户工具、只留下带禁止调用提示的保留工具，
   // 响应层再拒绝任何工具调用，不能仅靠提示词保证下游的禁用语义。
-  if (areToolsDisabled(payload) || payload.tool_choice == null) delete body.tool_choice
-  else body.tool_choice = payload.tool_choice
+  if (toolsDisabled || payload.tool_choice == null) delete body.tool_choice
+  else body.tool_choice = renameToolChoice(payload.tool_choice, adapted.names)
+
+  if (adapted.names.size) {
+    body.messages = payload.messages.map((message) => renameMessageTools(message, adapted.names))
+  }
 
   // 兼容既有 camelCase 别名；上游和官方 SDK 使用 snake_case，不能只影响本地过滤。
   const reasoningEffort = payload.reasoning_effort ?? payload.reasoningEffort
@@ -106,6 +162,12 @@ export function buildUpstreamRequest(payload, sessionId) {
 
   return {
     body: JSON.stringify(body),
+    toolAliases: adapted.aliases,
+    reservedToolNames: [...GATE_TOOL_NAMES],
+    toolNames: body.tools.map((tool) => tool?.function?.name).filter(Boolean),
+    clientToolNames: body.tools
+      .map((tool) => tool?.function?.name)
+      .filter((name) => name && !GATE_TOOL_NAMES.includes(name)),
     headers: {
       Accept: "text/event-stream",
       "Content-Type": "application/json",
