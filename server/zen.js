@@ -1,19 +1,17 @@
-// OpenCode Zen 上游客户端。免费层的硬门槛（均对真实上游逐项验证过）：
-//   1. User-Agent 必须形如 opencode/<version>，其他一律 403；
-//   2. 必须带 x-opencode-session，且值须为合法 ID 形状（ses_ + 12 位十六进制 + 14 位 base62）；
-//   3. 请求体必须含 bash / read 两个"门禁工具"，缺失即 403；
-//   4. stream 必须为 true，stream:false 一律 403。
-// 除此之外上游就是标准 OpenAI 协议，本模块只补齐上述条件，业务字段原样透传。
-import { ocId } from "./shared.js"
+// OpenCode V2 上游客户端。对照 2.0.29 源码与真实 CLI 抓包：
+//   - 使用 inference/v1、V2 User-Agent 和会话关联 headers，不发送旧的非标准 request ID；
+//   - 免费层要求 shell/read 的描述与参数 schema，旧版空工具定义会被 403；
+//   - 显式 tool_choice:none 也会被 403，改用保留工具描述并在响应层禁止工具调用。
+// 不注入 OpenCode 系统提示词；客户端工具名双向映射，消息正文和业务参数保持不变。
 import { debugLog } from "./log.js"
 
 // A local relay can recover rejected requests before the adapter sees them.
-const ZEN_API_BASE_URL = (process.env.ZEN_API_BASE_URL || "https://opencode.ai/zen/v1").replace(/\/+$/, "")
+const ZEN_API_BASE_URL = (process.env.ZEN_API_BASE_URL || "https://opencode.ai/inference/v1").replace(/\/+$/, "")
 const ZEN_CHAT_URL = `${ZEN_API_BASE_URL}/chat/completions`
 const ZEN_MODELS_URL = `${ZEN_API_BASE_URL}/models`
 
-// 上游通过 UA 判断请求是否来自 OpenCode 客户端；版本号对判定无影响（已验证）。
-const ZEN_USER_AGENT = "opencode/1.18.31"
+// 对齐 App.useragent：opencode/<channel>/<version>/<client>。
+const ZEN_USER_AGENT = "opencode/latest/2.0.29/cli"
 
 // 建立连接与模型列表的超时。注意：响应头之后的读取由 openai.js 的看门狗负责。
 const CONNECT_TIMEOUT_MS = Number(process.env.ZEN_CONNECT_TIMEOUT_MS || 60 * 1000)
@@ -21,8 +19,8 @@ if (!Number.isFinite(CONNECT_TIMEOUT_MS) || CONNECT_TIMEOUT_MS < 1 || CONNECT_TI
   throw new Error("ZEN_CONNECT_TIMEOUT_MS must be between 1 and 600000 milliseconds")
 }
 
-// 免费层门禁要求的工具名。只放必需的 bash / read（已验证最小集）。
-const GATE_TOOL_NAMES = ["bash", "read"]
+// V2 使用 shell 而不是 bash；只补真实上游已验证的最小集合。
+const GATE_TOOL_NAMES = ["shell", "read"]
 
 // 这些键名在 JS 里有特殊含义，用户塞进请求体没有任何意义，一律不转发给上游。
 const DANGEROUS_KEYS = ["__proto__", "constructor", "prototype"]
@@ -31,26 +29,99 @@ const GATE_TOOL_DESCRIPTION =
   "Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead."
 
 export function gateTool(name) {
+  // 描述前缀与 schema 对齐 V2 的 tool/plugin/{shell,read}.ts；空 schema 不再放行。
+  const shell = name === "shell"
   return {
     type: "function",
     function: {
       name,
-      description: GATE_TOOL_DESCRIPTION,
-      parameters: { type: "object", properties: {} },
+      description: `${shell ? "Execute a shell command and return its output." : "Read the contents of a file or directory."} ${GATE_TOOL_DESCRIPTION}`,
+      parameters: {
+        type: "object",
+        properties: shell
+          ? {
+              command: { type: "string", description: "Shell command string to execute" },
+              workdir: { type: "string", description: "Working directory to execute the command in" },
+              timeout: { type: "integer", minimum: 0, description: "Timeout in milliseconds" },
+              background: { type: "boolean", description: "Run the command in the background" },
+            }
+          : {
+              path: { type: "string", description: "File or directory to read" },
+              offset: { type: "integer", minimum: 0, description: "Starting line or directory entry (1-based)" },
+              limit: { type: "integer", minimum: 0, description: "Maximum lines or directory entries to read" },
+            },
+        required: [shell ? "command" : "path"],
+        additionalProperties: false,
+      },
+      strict: false,
     },
   }
 }
 
-// 用户已经自带同名工具时保留用户定义，只补缺失的门禁工具。
+export function areToolsDisabled(payload) {
+  return payload.tool_choice === "none" || !Array.isArray(payload.tools) || payload.tools.length === 0
+}
+
+// 上游还校验 edit 等其它内置工具；只改 read/shell 仍会拒绝完整客户端工具集。
+// 所有客户端工具统一使用上游别名，schema、调用 ID 和工具结果保持不变。
 function withGateTools(tools) {
-  const result = Array.isArray(tools) ? tools.filter((tool) => tool && typeof tool === "object") : []
-  const present = new Set(result.map((tool) => tool?.function?.name).filter((name) => typeof name === "string"))
-  for (const name of GATE_TOOL_NAMES) {
-    if (present.has(name)) continue
-    result.push(gateTool(name))
-    present.add(name)
+  const clientTools = Array.isArray(tools) ? tools.filter((tool) => tool && typeof tool === "object") : []
+  const present = new Set(clientTools.map((tool) => tool?.function?.name))
+  const names = new Map()
+  for (const tool of clientTools) {
+    const name = tool?.function?.name
+    if (typeof name !== "string" || !name || names.has(name)) continue
+    const base = `oc2api_${name.replace(/[^A-Za-z0-9_-]/g, "_")}`.slice(0, 60)
+    let alias = base
+    let suffix = 1
+    while (present.has(alias)) {
+      const tail = `_${suffix++}`
+      alias = `${base.slice(0, 64 - tail.length)}${tail}`
+    }
+    present.add(alias)
+    names.set(name, alias)
   }
-  return result
+  const result = clientTools.map((tool) => {
+    const renamed = renameToolCall(tool, names)
+    if (renamed === tool) return tool
+    return {
+      ...renamed,
+      function: {
+        ...renamed.function,
+        description: `Client tool "${tool.function.name}"; use "${renamed.function.name}" for the client's "${tool.function.name}" operation. ${tool.function.description || ""}`,
+      },
+    }
+  })
+  result.push(...GATE_TOOL_NAMES.map(gateTool))
+  return { tools: result, names, aliases: new Map([...names].map(([name, alias]) => [alias, name])) }
+}
+
+function renameToolCall(call, names) {
+  const name = names.get(call?.function?.name)
+  return name ? { ...call, function: { ...call.function, name } } : call
+}
+
+function renameToolChoice(choice, names) {
+  const renamed = renameToolCall(choice, names)
+  if (!Array.isArray(renamed?.tools)) return renamed
+  return {
+    ...renamed,
+    tools: renamed.tools.map((tool) => {
+      const next = renameToolCall(tool, names)
+      return names.has(next?.name) ? { ...next, name: names.get(next.name) } : next
+    }),
+  }
+}
+
+function renameMessageTools(message, names) {
+  let next = message
+  if (Array.isArray(message?.tool_calls)) {
+    next = { ...next, tool_calls: message.tool_calls.map((call) => renameToolCall(call, names)) }
+  }
+  const legacyName = names.get(message?.function_call?.name)
+  if (legacyName) next = { ...next, function_call: { ...message.function_call, name: legacyName } }
+  if (message?.role === "function" && names.has(message.name)) next = { ...next, name: names.get(message.name) }
+  return next
 }
 
 export function isAllowedModelId(id) {
@@ -59,9 +130,11 @@ export function isAllowedModelId(id) {
 
 // 上游只接受流式；下游是否流式由响应层决定，与这里无关。
 export function buildUpstreamRequest(payload, sessionId) {
+  const toolsDisabled = areToolsDisabled(payload)
+  const adapted = withGateTools(toolsDisabled ? [] : payload.tools)
   const body = {
     ...payload,
-    tools: withGateTools(payload.tools),
+    tools: adapted.tools,
     stream: true,
     stream_options: { include_usage: true },
   }
@@ -70,11 +143,14 @@ export function buildUpstreamRequest(payload, sessionId) {
   // 展开后原样带到上游 body 里（实测不污染本地原型，但没有任何透传价值）。
   for (const key of DANGEROUS_KEYS) delete body[key]
 
-  // 没有任何用户工具时禁止模型选中门禁工具；有用户工具时沿用下游的选择。
-  const hasUserTools = Array.isArray(payload.tools) && payload.tools.length > 0
-  if (!hasUserTools) body.tool_choice = "none"
-  else if (payload.tool_choice != null) body.tool_choice = payload.tool_choice
-  else delete body.tool_choice
+  // V2 拒绝 none。禁用时不提供用户工具、只留下带禁止调用提示的保留工具，
+  // 响应层再拒绝任何工具调用，不能仅靠提示词保证下游的禁用语义。
+  if (toolsDisabled || payload.tool_choice == null) delete body.tool_choice
+  else body.tool_choice = renameToolChoice(payload.tool_choice, adapted.names)
+
+  if (adapted.names.size) {
+    body.messages = payload.messages.map((message) => renameMessageTools(message, adapted.names))
+  }
 
   // 兼容既有 camelCase 别名；上游和官方 SDK 使用 snake_case，不能只影响本地过滤。
   const reasoningEffort = payload.reasoning_effort ?? payload.reasoningEffort
@@ -86,14 +162,23 @@ export function buildUpstreamRequest(payload, sessionId) {
 
   return {
     body: JSON.stringify(body),
+    toolAliases: adapted.aliases,
+    reservedToolNames: [...GATE_TOOL_NAMES],
+    toolNames: body.tools.map((tool) => tool?.function?.name).filter(Boolean),
+    clientToolNames: body.tools
+      .map((tool) => tool?.function?.name)
+      .filter((name) => name && !GATE_TOOL_NAMES.includes(name)),
     headers: {
       Accept: "text/event-stream",
       "Content-Type": "application/json",
       Authorization: "Bearer public",
       "User-Agent": ZEN_USER_AGENT,
-      "x-opencode-client": "desktop",
-      "x-opencode-request": ocId("msg"),
+      "x-opencode-client": "cli",
+      "x-opencode-project": "global",
       "x-opencode-session": sessionId,
+      "x-opencode-session-id": sessionId,
+      "x-session-affinity": sessionId,
+      "X-Session-Id": sessionId,
     },
   }
 }
