@@ -1,6 +1,6 @@
 # oc2api
 
-> ⚠️ **2026-08-21 提醒**：`deepseek-v4-flash-free` 模型已官方下线，不再提供免费额度。如需使用请更换其他模型，建议用 `big-pickle` 和 `mimo-v2.6-flash-free`，其中 `mimo-v2.6-flash-free` 支持图片输入。
+> ✅ **2026-10-15 提醒**：`deepseek-v4.1-flash-free` 当前可用（免费，上下文 200,000 / 输出 32,000 tokens，支持图片输入）。其他常用的免费模型还有 `big-pickle` 和 `mimo-v2.6-flash-free`，其中 `mimo-v2.6-flash-free` 同样支持图片输入。
 
 OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
 
