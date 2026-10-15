@@ -1,6 +1,6 @@
 // OpenCode V2 上游客户端。对照 2.0.29 源码与真实 CLI 抓包：
 //   - 使用 inference/v1、V2 User-Agent 和会话关联 headers，不发送旧的非标准 request ID；
-//   - 免费层要求 shell/read 的描述与参数 schema，旧版空工具定义会被 403；
+//   - 免费层要求内置 read 工具（名字与参数 schema），只带 read 即可放行，缺 read 一律 403；
 //   - 显式 tool_choice:none 也会被 403，改用保留工具描述并在响应层禁止工具调用。
 // 不注入 OpenCode 系统提示词；客户端工具名双向映射，消息正文和业务参数保持不变。
 import { debugLog } from "./log.js"
@@ -19,38 +19,33 @@ if (!Number.isFinite(CONNECT_TIMEOUT_MS) || CONNECT_TIMEOUT_MS < 1 || CONNECT_TI
   throw new Error("ZEN_CONNECT_TIMEOUT_MS must be between 1 and 600000 milliseconds")
 }
 
-// V2 使用 shell 而不是 bash；只补真实上游已验证的最小集合。
-const GATE_TOOL_NAMES = ["shell", "read"]
+// 上游只把 read 当作必需门禁：实测只带 read 必定放行，只带 shell/edit/write/glob 等一律 403。
+// 少注入一个门禁就少一个与客户端工具重名的干扰源，所以只保留 read。
+const GATE_TOOL_NAMES = ["read"]
 
 // 这些键名在 JS 里有特殊含义，用户塞进请求体没有任何意义，一律不转发给上游。
 const DANGEROUS_KEYS = ["__proto__", "constructor", "prototype"]
 
+// 旧版「禁止调用」描述。上游不校验文案（空描述同样放行），用最直白的旧写法，
+// 不再拼 V2 的业务原句，避免和客户端工具的描述混淆模型。
 const GATE_TOOL_DESCRIPTION =
   "Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead."
 
 export function gateTool(name) {
-  // 描述前缀与 schema 对齐 V2 的 tool/plugin/{shell,read}.ts；空 schema 不再放行。
-  const shell = name === "shell"
+  // 名字和参数 schema 必须保持 V2 read 的形态：改名、空 properties 都会被上游 403。
   return {
     type: "function",
     function: {
       name,
-      description: `${shell ? "Execute a shell command and return its output." : "Read the contents of a file or directory."} ${GATE_TOOL_DESCRIPTION}`,
+      description: GATE_TOOL_DESCRIPTION,
       parameters: {
         type: "object",
-        properties: shell
-          ? {
-              command: { type: "string", description: "Shell command string to execute" },
-              workdir: { type: "string", description: "Working directory to execute the command in" },
-              timeout: { type: "integer", minimum: 0, description: "Timeout in milliseconds" },
-              background: { type: "boolean", description: "Run the command in the background" },
-            }
-          : {
-              path: { type: "string", description: "File or directory to read" },
-              offset: { type: "integer", minimum: 0, description: "Starting line or directory entry (1-based)" },
-              limit: { type: "integer", minimum: 0, description: "Maximum lines or directory entries to read" },
-            },
-        required: [shell ? "command" : "path"],
+        properties: {
+          path: { type: "string", description: "File or directory to read" },
+          offset: { type: "integer", minimum: 0, description: "Starting line or directory entry (1-based)" },
+          limit: { type: "integer", minimum: 0, description: "Maximum lines or directory entries to read" },
+        },
+        required: ["path"],
         additionalProperties: false,
       },
       strict: false,
